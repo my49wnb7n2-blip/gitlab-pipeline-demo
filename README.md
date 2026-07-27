@@ -25,7 +25,7 @@ created_at  timestamp without time zone NOT NULL
 GitLab.com
   ├─ lint
   ├─ integration_test
-  │    └─ GitLab 托管 Runner + 临时 PostgreSQL
+  │    └─ Mac shell Runner + 本地临时 PostgreSQL 数据库
   └─ local_cleanup
        └─ Mac 上的 shell Runner
             └─ postgresql:///postgres
@@ -33,7 +33,8 @@ GitLab.com
 ```
 
 不需要在 Mac 上安装完整 GitLab Server，但必须安装 GitLab Runner。
-GitLab.com 负责调度，Mac Runner 负责连接只有本机才能访问的 PostgreSQL。
+所有 Job 都由 Mac Project Runner 执行，不使用 GitLab Hosted Runner，
+因此不需要为了使用免费计算额度而进行手机号或信用卡身份验证。
 
 ## 项目结构
 
@@ -189,11 +190,8 @@ Build
 → New pipeline
 ```
 
-选择 `main`，添加变量：
-
-```text
-MAINTENANCE_TASK=cleanup_audit_logs_test
-```
+选择 `main` 后直接创建 Pipeline。`MAINTENANCE_TASK` 已在
+`.gitlab-ci.yml` 中固定为 `cleanup_audit_logs_test`，页面不需要再填写。
 
 手动流水线的顺序：
 
@@ -226,13 +224,9 @@ Timezone: Asia/Shanghai
 Target branch: main
 ```
 
-添加 Schedule 变量：
+Schedule 不需要额外变量；`.gitlab-ci.yml` 已提供维护任务默认值。
 
-```text
-MAINTENANCE_TASK=cleanup_audit_logs_test
-```
-
-定时流水线会先在临时 PostgreSQL 中运行集成测试；只有测试成功后，
+定时流水线会先在本地临时 PostgreSQL 数据库中运行集成测试；只有测试成功后，
 Mac Runner 才会自动执行真实表的 plan、apply 和 verify。
 
 ## 运行条件
@@ -240,6 +234,8 @@ Mac Runner 才会自动执行真实表的 plan、apply 和 verify。
 - Mac 必须开机且不能处于睡眠状态。
 - PostgreSQL 和 `gitlab-runner` 后台服务必须运行。
 - Runner 必须带 `db-maintenance` tag。
-- Runner 的 `Run untagged jobs` 必须关闭，避免临时容器测试落到 shell Runner。
+- Runner 的 `Run untagged jobs` 必须关闭，避免接收没有明确 tag 的其他任务。
+- GitLab 项目中的 Instance runners 建议关闭，确保所有 Job 只使用本机 Runner。
+- shell Runner 只允许默认分支运行；不要让 fork 或未审查的 Merge Request 使用它。
 - 本地 PostgreSQL 不需要暴露到公网。
 - 首次真实清理建议把 `MAX_DELETE_ROWS` 和 `BATCH_SIZE` 设置得较小。
