@@ -1,15 +1,8 @@
 stages:
   - lint
   - integration-test
-  - dev-plan
-  - dev-apply
-  - dev-verify
-  - staging-plan
-  - staging-apply
-  - staging-verify
-  - production-plan
-  - production-apply
-  - production-verify
+  - local-plan
+  - local-cleanup
 
 workflow:
   rules:
@@ -29,15 +22,24 @@ variables:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: >
+        ($CI_PIPELINE_SOURCE == "schedule" ||
+         $CI_PIPELINE_SOURCE == "web") &&
+        $MAINTENANCE_TASK == "cleanup_audit_logs_test"
     - when: never
 
-.maintenance_job:
-  image: postgres:18-alpine
+.local_database_job:
   tags:
     - db-maintenance
   before_script:
-    - test -n "$DATABASE_URL"
+    - export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+    - test -n "${DATABASE_URL:-}"
     - test -x scripts/maintenance.sh
+    - command -v psql
+    - pg_isready -d "$DATABASE_URL"
+  environment:
+    name: local-production
+    deployment_tier: production
   timeout: 1h
   interruptible: false
   retry:
@@ -49,34 +51,8 @@ variables:
     - if: >
         ($CI_PIPELINE_SOURCE == "schedule" ||
          $CI_PIPELINE_SOURCE == "web") &&
-        $MAINTENANCE_TASK == "cleanup_audit_logs"
+        $MAINTENANCE_TASK == "cleanup_audit_logs_test"
     - when: never
-
-.plan_job:
-  extends: .maintenance_job
-  script:
-    - scripts/maintenance.sh plan
-    - cat plan.env
-  artifacts:
-    reports:
-      dotenv: plan.env
-    paths:
-      - plan.env
-    expire_in: 7 days
-
-.apply_job:
-  extends: .maintenance_job
-  script:
-    - scripts/maintenance.sh apply
-  artifacts:
-    paths:
-      - cleanup-report.env
-    expire_in: 30 days
-
-.verify_job:
-  extends: .maintenance_job
-  script:
-    - scripts/maintenance.sh verify
 
 lint:
   extends: .code_check_rules
@@ -114,121 +90,56 @@ integration_test:
     - scripts/maintenance.sh plan
     - scripts/maintenance.sh apply
     - scripts/maintenance.sh verify
-    - test "$(psql "$DATABASE_URL" -X -qAt -c 'SELECT count(*) FROM audit_logs;')" = "2"
-    - test "$(psql "$DATABASE_URL" -X -qAt -c 'SELECT count(*) FROM audit_logs WHERE id IS NULL;')" = "0"
+    - test "$(psql "$DATABASE_URL" -X -qAt -c 'SELECT count(*) FROM audit_logs_test;')" = "2"
+    - test "$(psql "$DATABASE_URL" -X -qAt -c 'SELECT count(*) FROM audit_logs_test WHERE uuid IS NULL;')" = "0"
 
-dev_plan:
-  extends: .plan_job
-  stage: dev-plan
-  environment:
-    name: dev
-    deployment_tier: development
-    action: verify
-  resource_group: audit-log-cleanup-dev
-
-dev_apply:
-  extends: .apply_job
-  stage: dev-apply
+local_plan:
+  extends: .local_database_job
+  stage: local-plan
   needs:
-    - job: dev_plan
-      artifacts: true
-  environment:
-    name: dev
-    deployment_tier: development
-  resource_group: audit-log-cleanup-dev
-
-dev_verify:
-  extends: .verify_job
-  stage: dev-verify
-  needs:
-    - job: dev_plan
-      artifacts: true
-    - job: dev_apply
-      artifacts: false
-  environment:
-    name: dev
-    deployment_tier: development
-    action: verify
-  resource_group: audit-log-cleanup-dev
-
-staging_plan:
-  extends: .plan_job
-  stage: staging-plan
-  needs:
-    - dev_verify
-  environment:
-    name: staging
-    deployment_tier: staging
-    action: verify
-  resource_group: audit-log-cleanup-staging
-
-staging_apply:
-  extends: .apply_job
-  stage: staging-apply
-  needs:
-    - job: staging_plan
-      artifacts: true
-  environment:
-    name: staging
-    deployment_tier: staging
-  resource_group: audit-log-cleanup-staging
-
-staging_verify:
-  extends: .verify_job
-  stage: staging-verify
-  needs:
-    - job: staging_plan
-      artifacts: true
-    - job: staging_apply
-      artifacts: false
-  environment:
-    name: staging
-    deployment_tier: staging
-    action: verify
-  resource_group: audit-log-cleanup-staging
-
-production_plan:
-  extends: .plan_job
-  stage: production-plan
-  needs:
-    - staging_verify
-  environment:
-    name: production-plan
-    deployment_tier: production
-    action: verify
-  resource_group: audit-log-cleanup-production
+    - integration_test
+  script:
+    - scripts/maintenance.sh plan
+    - cat plan.env
   artifacts:
     reports:
       dotenv: plan.env
     paths:
       - plan.env
-    expire_in: 30 days
+    expire_in: 7 days
+  rules:
+    - if: >
+        $CI_PIPELINE_SOURCE == "web" &&
+        $MAINTENANCE_TASK == "cleanup_audit_logs_test"
+    - when: never
 
-production_apply:
-  extends: .apply_job
-  stage: production-apply
+local_cleanup:
+  extends: .local_database_job
+  stage: local-cleanup
   needs:
-    - job: production_plan
-      artifacts: true
-  environment:
-    name: production
-    deployment_tier: production
-  resource_group: audit-log-cleanup-production
-  when: manual
-  allow_failure: false
-  manual_confirmation: "确认清理 production 中超过 90 天的 audit_logs 数据吗？"
-
-production_verify:
-  extends: .verify_job
-  stage: production-verify
-  needs:
-    - job: production_plan
-      artifacts: true
-    - job: production_apply
+    - integration_test
+    - job: local_plan
       artifacts: false
-  environment:
-    name: production-plan
-    deployment_tier: production
-    action: verify
-  resource_group: audit-log-cleanup-production
-
+      optional: true
+  script:
+    - scripts/maintenance.sh plan
+    - cat plan.env
+    - scripts/maintenance.sh apply
+    - scripts/maintenance.sh verify
+  artifacts:
+    paths:
+      - plan.env
+      - cleanup-report.env
+    expire_in: 30 days
+  resource_group: audit-logs-test-local
+  rules:
+    - if: >
+        $CI_PIPELINE_SOURCE == "schedule" &&
+        $MAINTENANCE_TASK == "cleanup_audit_logs_test"
+    - if: >
+        $CI_PIPELINE_SOURCE == "web" &&
+        $MAINTENANCE_TASK == "cleanup_audit_logs_test"
+      when: manual
+    - when: never
+  allow_failure: false
+  manual_confirmation: "确认清理本机 PostgreSQL 中超过 90 天的 audit_logs_test 数据吗？"

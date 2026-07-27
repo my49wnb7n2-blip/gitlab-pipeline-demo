@@ -64,11 +64,11 @@ cd "$TEST_WORK_DIRECTORY"
 
 remaining_rows="$(
   psql "$DATABASE_URL" -X -qAt \
-    -c 'SELECT count(*) FROM audit_logs;'
+    -c 'SELECT count(*) FROM audit_logs_test;'
 )"
 null_ids="$(
   psql "$DATABASE_URL" -X -qAt \
-    -c 'SELECT count(*) FROM audit_logs WHERE id IS NULL;'
+    -c 'SELECT count(*) FROM audit_logs_test WHERE uuid IS NULL;'
 )"
 
 [ "$remaining_rows" = "2" ] || {

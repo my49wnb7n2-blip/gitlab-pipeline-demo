@@ -1,25 +1,45 @@
-# GitLab PostgreSQL Cleanup Pipeline Demo
+# GitLab 清理本机 PostgreSQL
 
-这个示例项目演示如何使用 GitLab CI/CD 安全地清理 PostgreSQL
-`audit_logs` 表中超过 90 天的数据。
+这个项目通过 GitLab CI/CD 定期清理本机 PostgreSQL：
 
-主要保护措施：
+```text
+database: postgres
+schema:   public
+table:    audit_logs_test
+条件:     created_at 早于 90 天
+```
 
-- Merge Request 中启动临时 PostgreSQL 做集成测试。
-- dev 和 staging 依次执行 plan、分批清理和验证。
-- production 先使用只读账号生成计划，再等待人工批准。
-- 使用固定截止时间，避免各 Job 对“90 天前”产生不同理解。
-- 每批独立删除，降低大事务和长时间锁表的风险。
-- 使用 `MAX_DELETE_ROWS` 限制单次最大删除量。
-- 使用 `resource_group` 防止同一环境并发清理。
-- UUID 主键由 PostgreSQL 的 `gen_random_uuid()` 自动生成。
+目标表结构：
+
+```sql
+uuid        uuid PRIMARY KEY
+log_message text NOT NULL
+created_at  timestamp without time zone NOT NULL
+```
+
+清理目标在脚本中固定为 `public.audit_logs_test`，避免通过 CI 变量传入错误表名。
+
+## 执行架构
+
+```text
+GitLab.com
+  ├─ lint
+  ├─ integration_test
+  │    └─ GitLab 托管 Runner + 临时 PostgreSQL
+  └─ local_cleanup
+       └─ Mac 上的 shell Runner
+            └─ postgresql:///postgres
+                 └─ public.audit_logs_test
+```
+
+不需要在 Mac 上安装完整 GitLab Server，但必须安装 GitLab Runner。
+GitLab.com 负责调度，Mac Runner 负责连接只有本机才能访问的 PostgreSQL。
 
 ## 项目结构
 
 ```text
 .
 ├── .gitlab-ci.yml
-├── .gitignore
 ├── README.md
 ├── scripts
 │   ├── maintenance.sh
@@ -30,167 +50,166 @@
     └── seed_test_data.sql
 ```
 
-## 本地测试
+## 安全清理过程
 
-要求：
+`scripts/maintenance.sh` 支持：
 
-- PostgreSQL 正在本地运行。
-- 当前系统用户可以创建测试数据库。
-- 已安装 `createdb`、`dropdb`、`pg_isready` 和 `psql`。
+```text
+plan    计算固定截止时间和预计删除数量
+apply   使用同一截止时间分批删除
+verify  确认截止时间之前的数据已清空
+```
 
-执行：
+默认保护参数：
+
+| 变量 | 默认值 | 作用 |
+|---|---:|---|
+| `RETENTION_DAYS` | `90` | 保留最近多少天的数据 |
+| `BATCH_SIZE` | `5000` | 每批最多删除多少行 |
+| `BATCH_SLEEP_SECONDS` | `1` | 两批之间暂停多少秒 |
+| `MAX_DELETE_ROWS` | `1000000` | 预计删除数超过该值时停止 |
+| `DATABASE_URL` | 无 | PostgreSQL 连接地址，必须配置 |
+
+本地集成测试：
 
 ```bash
 ./scripts/run_local_test.sh
 ```
 
-脚本只会创建名称类似下面的临时数据库：
+测试脚本会创建一个临时数据库，插入 3 条旧记录和 2 条新记录，
+验证只删除 3 条旧记录，最后自动删除临时数据库。它不会操作真实的
+`postgres` 数据库。
 
-```text
-gitlab_pipeline_demo_test_12345
+## 真实表需要的索引
+
+第一次运行清理前，在真实数据库中执行：
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_logs_test_cleanup
+ON public.audit_logs_test (created_at, uuid);
 ```
 
-测试完成或失败退出时都会删除该临时数据库，不会操作现有业务数据库。
+这条索引用于快速查找旧数据，并支持按照 `created_at, uuid` 分批删除。
 
-测试过程会：
+## 1. 把项目放到 GitLab
 
-1. 建立 `audit_logs` 表。
-2. 插入 3 条超过 90 天和 2 条近期数据。
-3. 确认 UUID 默认值自动生成。
-4. 以每批 2 条的方式删除 3 条旧数据。
-5. 验证最终只保留 2 条近期数据。
-
-## 清理脚本接口
-
-生成清理计划：
+在 GitLab.com 创建空项目 `gitlab-pipeline-demo`，然后给本地仓库添加
+GitLab remote：
 
 ```bash
-DATABASE_URL="postgresql:///your_database" \
-  ./scripts/maintenance.sh plan
+git remote add gitlab git@gitlab.com:<你的GitLab用户名>/gitlab-pipeline-demo.git
+git push -u gitlab main
 ```
 
-计划会生成忽略提交的 `plan.env`：
-
-```text
-CUTOFF_AT=2026-04-25T02:30:00.000000Z
-ELIGIBLE_ROWS=1234
-```
-
-执行清理：
+当前 GitHub `origin` 可以继续保留；以后可以分别推送：
 
 ```bash
-DATABASE_URL="postgresql:///your_database" \
-  ./scripts/maintenance.sh apply
+git push origin main
+git push gitlab main
 ```
 
-验证：
+## 2. 在 Mac 安装并注册 Runner
+
+安装并启动：
 
 ```bash
-DATABASE_URL="postgresql:///your_database" \
-  ./scripts/maintenance.sh verify
+brew install gitlab-runner
+brew services start gitlab-runner
 ```
 
-支持的变量：
-
-| 变量 | 默认值 | 作用 |
-|---|---:|---|
-| `RETENTION_DAYS` | `90` | 数据保留天数 |
-| `BATCH_SIZE` | `5000` | 单批删除行数 |
-| `BATCH_SLEEP_SECONDS` | `1` | 批次间隔秒数 |
-| `MAX_DELETE_ROWS` | `1000000` | 单次允许删除的最大行数 |
-| `DATABASE_URL` | 无 | PostgreSQL 连接地址，必须提供 |
-
-## GitLab 流程
-
-代码提交或 Merge Request：
+GitLab 项目页面进入：
 
 ```text
-lint
-  → integration_test
+Settings
+→ CI/CD
+→ Runners
+→ Create project runner
 ```
 
-定时或网页手动维护：
+设置：
 
 ```text
-dev_plan
-  → dev_apply
-  → dev_verify
-  → staging_plan
-  → staging_apply
-  → staging_verify
-  → production_plan
-  → production_apply（人工确认）
-  → production_verify
+Operating system: macOS
+Tags: db-maintenance
+Run untagged jobs: 关闭
 ```
 
-## 从 GitHub 导入 GitLab
-
-GitHub 不会执行 `.gitlab-ci.yml`。需要在 GitLab 中创建项目并导入这个仓库：
+保存后，按照 GitLab 页面显示的认证命令注册，Executor 选择：
 
 ```text
-GitLab
-→ New project
-→ Import project
-→ GitHub 或 Repository by URL
-→ 选择 gitlab-pipeline-demo
+shell
 ```
 
-导入后在 GitLab 的 Pipeline Editor 中验证：
+确认 Runner：
 
-```text
-Build
-→ Pipeline editor
-→ Validate
+```bash
+gitlab-runner verify
+brew services list
 ```
 
-如果希望 GitHub 后续提交自动同步到 GitLab，需要配置 repository
-mirroring，或者把 GitLab 作为另一个 Git remote 并同时推送。
+Runner 必须使用当前 Mac 用户启动，这样 `127.0.0.1` 或本地 Unix socket
+才表示安装 PostgreSQL 的这台电脑。`.gitlab-ci.yml` 已把
+`/opt/homebrew/bin` 加入 PATH，以便后台 Runner 找到 `psql`。
 
-## Runner
+## 3. 配置数据库连接变量
 
-真实数据库 Job 使用：
-
-```yaml
-tags:
-  - db-maintenance
-```
-
-因此需要一个带 `db-maintenance` tag、能够访问各环境数据库的
-self-hosted GitLab Runner。Runner 不应为了方便而获得整个内网权限。
-
-如果只是学习 Pipeline，可以临时移除 `.maintenance_job` 中的 `tags`；
-但 production 数据库不建议使用公共共享 Runner。
-
-## GitLab CI/CD Variables
-
-进入：
+GitLab 项目进入：
 
 ```text
 Settings
 → CI/CD
 → Variables
+→ Add variable
 ```
 
-添加以下同名、不同 Environment scope 的变量：
+本机开发验证可以先配置：
 
-| Key | Environment scope | 数据库权限 |
-|---|---|---|
-| `DATABASE_URL` | `dev` | `SELECT, DELETE` |
-| `DATABASE_URL` | `staging` | `SELECT, DELETE` |
-| `DATABASE_URL` | `production-plan` | 仅 `SELECT` |
-| `DATABASE_URL` | `production` | `SELECT, DELETE` |
+```text
+Key: DATABASE_URL
+Value: postgresql:///postgres
+Environment scope: local-production
+Expand variable reference: 关闭
+```
 
-production 相关变量应设置为：
+如果以后改成带密码的最小权限账号，可以使用：
 
-- Masked and hidden
-- Protected
-- Expand variable reference 关闭
+```text
+postgresql://audit_cleanup:<URL编码后的密码>@127.0.0.1:5432/postgres
+```
 
-不要把数据库密码写进 `.gitlab-ci.yml`。
+不要把数据库密码提交到 `.gitlab-ci.yml`。
 
-## 创建定时任务
+## 4. 手动验证
 
-进入：
+GitLab 项目进入：
+
+```text
+Build
+→ Pipelines
+→ New pipeline
+```
+
+选择 `main`，添加变量：
+
+```text
+MAINTENANCE_TASK=cleanup_audit_logs_test
+```
+
+手动流水线的顺序：
+
+```text
+lint
+→ integration_test
+→ local_plan
+→ local_cleanup（需要点击确认）
+```
+
+`local_plan` 只显示预计删除数量。`local_cleanup` 会重新生成最新计划，
+然后在同一个 Job 中执行 plan、apply 和 verify，防止两个流水线交叉清理。
+
+## 5. 创建定时清理
+
+GitLab 项目进入：
 
 ```text
 Build
@@ -198,27 +217,29 @@ Build
 → New schedule
 ```
 
-建议配置：
+示例：
 
 ```text
-Description: Daily audit_logs cleanup
+Description: Daily audit_logs_test cleanup
 Cron: 30 2 * * *
 Timezone: Asia/Shanghai
 Target branch: main
 ```
 
-添加变量：
+添加 Schedule 变量：
 
 ```text
-MAINTENANCE_TASK=cleanup_audit_logs
+MAINTENANCE_TASK=cleanup_audit_logs_test
 ```
 
-## 生产上线前检查
+定时流水线会先在临时 PostgreSQL 中运行集成测试；只有测试成功后，
+Mac Runner 才会自动执行真实表的 plan、apply 和 verify。
 
-- 确认 `(created_at, id)` 索引已提前创建。
-- 确认外键不存在意外级联删除。
-- 确认数据库备份和恢复演练有效。
-- 先观察 production plan 的 `ELIGIBLE_ROWS`。
-- 检查数据库 CPU、锁等待、WAL 和复制延迟。
-- 使用最小权限数据库账号。
-- 将 `production` 配置为 Protected environment。
+## 运行条件
+
+- Mac 必须开机且不能处于睡眠状态。
+- PostgreSQL 和 `gitlab-runner` 后台服务必须运行。
+- Runner 必须带 `db-maintenance` tag。
+- Runner 的 `Run untagged jobs` 必须关闭，避免临时容器测试落到 shell Runner。
+- 本地 PostgreSQL 不需要暴露到公网。
+- 首次真实清理建议把 `MAX_DELETE_ROWS` 和 `BATCH_SIZE` 设置得较小。

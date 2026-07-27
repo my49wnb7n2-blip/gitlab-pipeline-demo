@@ -56,10 +56,10 @@ calculate_cutoff() {
     -v retention_days="$RETENTION_DAYS" <<'SQL'
 SELECT to_char(
   (
-    CURRENT_TIMESTAMP -
+    LOCALTIMESTAMP -
     make_interval(days => (:'retention_days')::integer)
-  ) AT TIME ZONE 'UTC',
-  'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+  ),
+  'YYYY-MM-DD"T"HH24:MI:SS.US'
 );
 SQL
 }
@@ -73,8 +73,8 @@ count_eligible_rows() {
     -v ON_ERROR_STOP=1 \
     -v cutoff_at="$cutoff_at" <<'SQL'
 SELECT count(*)
-FROM audit_logs
-WHERE created_at < (:'cutoff_at')::timestamptz;
+FROM public.audit_logs_test
+WHERE created_at < (:'cutoff_at')::timestamp;
 SQL
 }
 
@@ -129,6 +129,22 @@ apply_cleanup() {
   total_deleted=0
 
   while :; do
+    remaining_allowance=$((MAX_DELETE_ROWS - total_deleted))
+
+    if [ "$remaining_allowance" -eq 0 ]; then
+      remaining_rows="$(count_eligible_rows "$CUTOFF_AT")"
+
+      [ "$remaining_rows" -eq 0 ] ||
+        fail "stopped after MAX_DELETE_ROWS ($MAX_DELETE_ROWS); $remaining_rows eligible rows remain"
+
+      break
+    fi
+
+    effective_batch_size="$BATCH_SIZE"
+    if [ "$effective_batch_size" -gt "$remaining_allowance" ]; then
+      effective_batch_size="$remaining_allowance"
+    fi
+
     deleted_rows="$(
       PGOPTIONS="-c lock_timeout=5000 -c statement_timeout=60000" \
         psql "$DATABASE_URL" \
@@ -136,20 +152,20 @@ apply_cleanup() {
           -qAt \
           -v ON_ERROR_STOP=1 \
           -v cutoff_at="$CUTOFF_AT" \
-          -v batch_size="$BATCH_SIZE" <<'SQL'
+          -v batch_size="$effective_batch_size" <<'SQL'
 WITH doomed AS (
-  SELECT id
-  FROM audit_logs
-  WHERE created_at < (:'cutoff_at')::timestamptz
-  ORDER BY created_at, id
+  SELECT uuid
+  FROM public.audit_logs_test
+  WHERE created_at < (:'cutoff_at')::timestamp
+  ORDER BY created_at, uuid
   LIMIT (:'batch_size')::integer
   FOR UPDATE SKIP LOCKED
 ),
 deleted AS (
-  DELETE FROM audit_logs AS target
+  DELETE FROM public.audit_logs_test AS target
   USING doomed
-  WHERE target.id = doomed.id
-  RETURNING target.id
+  WHERE target.uuid = doomed.uuid
+  RETURNING target.uuid
 )
 SELECT count(*) FROM deleted;
 SQL
@@ -213,4 +229,3 @@ case "${1:-}" in
     usage
     ;;
 esac
-
